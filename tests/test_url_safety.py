@@ -759,6 +759,7 @@ def _system_proxies(monkeypatch, mapping: dict) -> None:
 
 def test_proxy_hosts_reads_environment_and_honours_no_proxy(monkeypatch) -> None:
     _system_proxies(monkeypatch, {"https": "http://127.0.0.1:3128"})
+    monkeypatch.delenv("no_proxy", raising=False)
     monkeypatch.setenv("NO_PROXY", "direct.example")
     assert url_safety._proxy_hosts("https://example.com/") == frozenset({"127.0.0.1"})
     assert url_safety._proxy_hosts("https://direct.example/") == frozenset()
@@ -954,6 +955,9 @@ def test_safe_requests_session_refuses_a_non_public_proxy(monkeypatch) -> None:
 def _clear_local_targets(monkeypatch):
     """No test in this module inherits the developer's own allowlist."""
     monkeypatch.delenv("CLAUDE_SEO_LOCAL_TARGETS", raising=False)
+    # Unit tests control proxy selection explicitly; Cloud exports a real
+    # private egress proxy, which must not leak into mocked HTTP transports.
+    _system_proxies(monkeypatch, {})
 
 
 def _loopback_resolver(host_ips: dict):
