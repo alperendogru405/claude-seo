@@ -856,6 +856,7 @@ def render_page(
             _keep_raw_on_render_failure()
             return result
         finally:
+            result["render_diagnostics"].extend(getattr(route_handler, "failures", []))
             result["render_ms"] = (time.monotonic() - start) * 1000.0
 
         # Both versions exist: measure what only JavaScript provides.

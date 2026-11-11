@@ -75,21 +75,12 @@ delegated to the agent-process layer.
 
 Limitations
 ===========
-Playwright/Chromium-based fetches (``render_page.py``,
-``capture_screenshot.py``) perform their own DNS resolution inside
-Chromium and therefore cannot be DNS-pinned at the Python layer. Those
-scripts must:
+Guarded browser HTTP(S) resources are fulfilled using verified Python
+transport, with or without a proxy, instead of native Chromium connections.
+Native HTTP redirects are blocked: Playwright routes only the first request
+of a redirect chain. Redirect-aware browser transport is still required;
+raw HTTP redirects remain supported and are validated per hop.
 
-  1. Call ``validate_url_strict()`` as a pre-flight check, AND
-  2. Attach a Playwright ``route()`` handler that re-validates each
-     resolved request IP and aborts subresource fetches to private
-     ranges.
-
-The residual DNS-rebinding risk for browser-based fetches is documented
-in SECURITY.md.
-
-With a configured HTTP proxy, browser routes fulfil public resources using
-the verified Python transport instead of a separate Chromium connection.
 Codex Cloud's private proxy socket is trusted only through immutable platform
 metadata and static host mappings. This does not trust private audit targets.
 As with any CONNECT proxy, destination DNS policy must also be enforced by the
@@ -109,7 +100,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 try:
     import requests
@@ -700,14 +691,19 @@ def _managed_proxy_manifest() -> Optional[str]:
 
 
 def _proxy_endpoint(value: str) -> tuple[str, str, int]:
+    if not isinstance(value, str):
+        raise URLSafetyError('Unsupported managed proxy URL')
     parsed = urlparse(value)
     if (parsed.scheme not in ('http', 'https') or not parsed.hostname
             or parsed.username is not None or parsed.password is not None
             or parsed.path not in ('', '/') or parsed.query or parsed.fragment):
         raise URLSafetyError('Unsupported managed proxy URL')
-    return parsed.scheme, normalize_hostname(parsed.hostname), parsed.port or (
-        443 if parsed.scheme == 'https' else 80
-    )
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme == 'https' else 80
+    if not 1 <= port <= 65535:
+        raise URLSafetyError('Invalid managed proxy port')
+    return parsed.scheme, normalize_hostname(parsed.hostname), port
 
 
 def _managed_proxy(url: str, proxies: Optional[dict] = None) -> Optional[tuple[str, int, str]]:
@@ -763,7 +759,25 @@ def _managed_proxy(url: str, proxies: Optional[dict] = None) -> Optional[tuple[s
     return host, port, addresses[0]
 
 
-class _ManagedProxyAdapter(requests.adapters.HTTPAdapter):
+class _VerifiedTLSAdapter(requests.adapters.HTTPAdapter):
+    """Reject disabled certificate verification after session/env merging."""
+
+    def __init__(self, *args, redirect_guard=None, **kwargs):
+        self.redirect_guard = redirect_guard
+        super().__init__(*args, **kwargs)
+
+    def send(self, request, **kwargs):
+        if not kwargs.get('verify', True):
+            raise URLSafetyError('TLS verification is required for safe requests')
+        response = super().send(request, **kwargs)
+        if self.redirect_guard:
+            self.redirect_guard(response)
+        # Enforce the cap before optional caller response hooks can replace
+        # session hooks. Neither redirect validation nor its cap is optional.
+        return _bound_redirect_body(response)
+
+
+class _ManagedProxyAdapter(_VerifiedTLSAdapter):
     """Validate every redirect/session target before allowing proxy transport."""
 
     def send(self, request, **kwargs):
@@ -808,8 +822,8 @@ def _assert_proxy_host_is_public(host: str) -> str:
     """
     normalized = normalize_hostname(host)
     hint = (
-        "Point the proxy environment variable at a publicly routable "
-        "address, or unset it."
+        "Use a public proxy or the exact immutable platform proxy contract. "
+        "Do not bypass a required egress policy."
     )
     if normalized in _BLOCKED_HOSTNAMES:
         raise URLSafetyError(
@@ -1355,6 +1369,54 @@ def _with_default_headers(kwargs: dict) -> dict:
     return kwargs
 
 
+def _redirect_target_guard(initial_url: str, pinned_ip: str):
+    """Validate Location before requests can ask a proxy to follow it.
+
+    Direct DNS pinning already guards redirects resolved locally, but a
+    public CONNECT proxy resolves them itself. Preserve the exact original
+    local-dev host/port opt-in without extending it to other private hosts.
+    """
+    initial = urlparse(initial_url)
+
+    def guard(response, *args, **kwargs):
+        if not response.is_redirect:
+            return response
+        try:
+            target = urljoin(response.url, response.headers['Location'])
+            parsed = urlparse(target)
+            allow_local = (
+                not is_safe_ip(pinned_ip)
+                and parsed.hostname is not None
+                and normalize_hostname(parsed.hostname) == normalize_hostname(initial.hostname)
+                and _local_pin_allows_port(initial.hostname, _url_port(initial), _url_port(parsed))
+            )
+            validate_url_strict(target, allow_local=allow_local)
+        except Exception:
+            response.close()
+            raise
+        return response
+
+    return guard
+
+
+def _with_proxy_redirect_guard(kwargs: dict, url: str, pinned_ip: str) -> dict:
+    hooks = dict(kwargs.get('hooks') or {})
+    existing = hooks.get('response') or []
+    if callable(existing):
+        existing = [existing]
+    hooks['response'] = [_redirect_target_guard(url, pinned_ip), *existing]
+    kwargs['hooks'] = hooks
+    return kwargs
+
+
+def _check_requested_tls(kwargs: dict) -> None:
+    # requests treats None as "inherit the session setting"; False/0/empty
+    # values can disable verification and must not reach its plain API.
+    value = kwargs.get('verify', True)
+    if value is not None and not value:
+        raise URLSafetyError('TLS verification is required for safe requests')
+
+
 def safe_requests_get(
     url: str,
     *,
@@ -1369,6 +1431,7 @@ def safe_requests_get(
     except that browser-like default headers are supplied for any header
     the caller did not set (see ``DEFAULT_REQUEST_HEADERS``).
     """
+    _check_requested_tls(kwargs)
     norm_url, pinned_ip = validate_url_strict(url)
     parsed = urlparse(norm_url)
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -1377,6 +1440,8 @@ def safe_requests_get(
     if _managed_proxy(norm_url, kwargs.get('proxies')):
         return _managed_request('GET', norm_url, timeout=timeout, **kwargs)
     exempt = _validated_proxy_hosts(norm_url, kwargs.get("proxies"))
+    if exempt:
+        kwargs = _with_proxy_redirect_guard(kwargs, norm_url, pinned_ip)
     with _pin_dns(parsed.hostname, pinned_ip, port, exempt_hosts=exempt):
         return requests.get(norm_url, timeout=timeout, **kwargs)
 
@@ -1395,6 +1460,7 @@ def safe_requests_head(
     except that browser-like default headers are supplied for any header
     the caller did not set (see ``DEFAULT_REQUEST_HEADERS``).
     """
+    _check_requested_tls(kwargs)
     norm_url, pinned_ip = validate_url_strict(url)
     parsed = urlparse(norm_url)
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -1403,6 +1469,8 @@ def safe_requests_head(
     if _managed_proxy(norm_url, kwargs.get('proxies')):
         return _managed_request('HEAD', norm_url, timeout=timeout, **kwargs)
     exempt = _validated_proxy_hosts(norm_url, kwargs.get("proxies"))
+    if exempt:
+        kwargs = _with_proxy_redirect_guard(kwargs, norm_url, pinned_ip)
     with _pin_dns(parsed.hostname, pinned_ip, port, exempt_hosts=exempt):
         return requests.head(norm_url, timeout=timeout, **kwargs)
 
@@ -1419,6 +1487,9 @@ def safe_requests_session(url: str) -> Iterator[requests.Session]:
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     assert parsed.hostname is not None
     session = requests.Session()
+    redirect_guard = _redirect_target_guard(norm_url, pinned_ip)
+    session.mount('http://', _VerifiedTLSAdapter(redirect_guard=redirect_guard))
+    session.mount('https://', _VerifiedTLSAdapter(redirect_guard=redirect_guard))
     # Session hooks apply to every request made on it, including each
     # redirect hop, unless a request passes its own response hooks.
     session.hooks["response"].append(_bound_redirect_body)
@@ -1463,6 +1534,7 @@ def make_safe_playwright_route_handler(
         ``page.route("**/*", handler)``.
     """
     blocked = set(blocked_resource_types or ())
+    failures: list[str] = []
 
     def handler(route, request):  # type: ignore[no-untyped-def]
         try:
@@ -1509,24 +1581,31 @@ def make_safe_playwright_route_handler(
             if not ips or any(not is_safe_ip(ip) for ip in ips):
                 route.abort()
                 return
-            if _selected_proxy(request.url):
-                # Chromium does not inherit requests' proxy/CA settings.
-                # Fulfil through the same verified egress instead of opening
-                # a second, unconfigured browser connection. Redirects remain
-                # browser-visible and each next hop re-enters this guard.
-                _fulfill_proxied_route(route, request)
-                return
-            route.continue_()
-        except Exception:  # pragma: no cover - fail-closed
+            # Use verified transport even without a proxy. A native Chromium
+            # continuation cannot enforce our policy on HTTP redirect hops.
+            _fulfill_verified_route(route, request)
+        except Exception as exc:  # fail-closed, with a non-sensitive diagnostic
+            if isinstance(exc, _UnsafeBrowserRedirect):
+                failures.append(
+                    'Browser redirect blocked: Playwright does not '
+                    're-intercept native redirect hops; redirect-aware transport required'
+                )
+            elif isinstance(exc, requests.exceptions.SSLError):
+                failures.append('Browser resource TLS verification failed')
             try:
                 route.abort()
             except Exception:
                 pass
 
+    handler.failures = failures
     return handler
 
 
-def _fulfill_proxied_route(route, request):
+class _UnsafeBrowserRedirect(URLSafetyError):
+    """Never emit a redirect Chromium can follow outside our route guard."""
+
+
+def _fulfill_verified_route(route, request):
     headers = {key: value for key, value in request.all_headers().items()
                if key.lower() not in ('host', 'proxy-authorization', 'proxy-connection')}
     response = _managed_request(
@@ -1534,6 +1613,12 @@ def _fulfill_proxied_route(route, request):
         data=request.post_data_buffer, timeout=30, stream=True, allow_redirects=False,
     )
     try:
+        if response.status_code in (301, 302, 303, 307, 308) and response.headers.get('Location'):
+            # Playwright only routes the FIRST request of an HTTP redirect
+            # chain. Forwarding a 3xx lets Chromium connect to later targets
+            # without this guard. Do not replace it with a 200/body rewrite:
+            # that would misrepresent status, final URL and origin semantics.
+            raise _UnsafeBrowserRedirect('Unsafe native browser redirect')
         body, too_large = read_bounded(response, MAX_PAGE_BYTES)
         if too_large:
             raise URLSafetyError('Browser resource exceeded the response body limit')
@@ -1580,6 +1665,8 @@ def new_guarded_context(browser, route_handler, **context_kwargs):  # type: igno
     Returns:
         The new ``BrowserContext``.
     """
+    if context_kwargs.get('ignore_https_errors'):
+        raise URLSafetyError('TLS verification is required for guarded browser contexts')
     context = browser.new_context(service_workers="block", **context_kwargs)
     context.route("**/*", route_handler)
     context.route_web_socket("**/*", _never_connect_web_socket)

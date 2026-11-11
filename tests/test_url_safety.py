@@ -499,6 +499,9 @@ class _FakeRoute:
     def continue_(self) -> None:
         self.action = "continue"
 
+    def fulfill(self, **kwargs) -> None:
+        self.action = "fulfill"
+
 
 class _FakeRequest:
     def __init__(self, url: str, resource_type: str = "document") -> None:
@@ -506,13 +509,17 @@ class _FakeRequest:
         self.resource_type = resource_type
 
 
-def test_route_handler_continues_public_host() -> None:
+def test_route_handler_fulfills_public_host_through_verified_transport() -> None:
     handler = url_safety.make_safe_playwright_route_handler()
     fake_addrinfo = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 443))]
-    with patch.object(url_safety.socket, "getaddrinfo", return_value=fake_addrinfo):
+    with patch.object(url_safety.socket, "getaddrinfo", return_value=fake_addrinfo), patch.object(
+        url_safety, "_fulfill_verified_route",
+        side_effect=lambda route, request: route.fulfill(status=200, body=b"fixture"),
+    ) as transport:
         route = _FakeRoute()
         handler(route, _FakeRequest("https://safe.example/style.css"))
-        assert route.action == "continue"
+        assert route.action == "fulfill"
+        transport.assert_called_once()
 
 
 def test_route_handler_aborts_private_resolution() -> None:
@@ -587,16 +594,20 @@ def test_route_handler_blocks_when_ipv6_resolution_is_private() -> None:
         assert route.action == "abort"
 
 
-def test_route_handler_continues_when_both_ipv4_and_ipv6_public() -> None:
+def test_route_handler_fulfills_when_both_ipv4_and_ipv6_public() -> None:
     handler = url_safety.make_safe_playwright_route_handler()
     fake = [
         (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 0)),
         (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2606:4700:4700::1111", 0, 0, 0)),
     ]
-    with patch.object(url_safety.socket, "getaddrinfo", return_value=fake):
+    with patch.object(url_safety.socket, "getaddrinfo", return_value=fake), patch.object(
+        url_safety, "_fulfill_verified_route",
+        side_effect=lambda route, request: route.fulfill(status=200, body=b"fixture"),
+    ) as transport:
         route = _FakeRoute()
         handler(route, _FakeRequest("https://safe-dualstack.example/"))
-        assert route.action == "continue"
+        assert route.action == "fulfill"
+        transport.assert_called_once()
 
 
 def test_guarded_context_blocks_service_workers_and_never_connects_websockets() -> None:
