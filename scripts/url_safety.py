@@ -77,9 +77,11 @@ Limitations
 ===========
 Guarded browser HTTP(S) resources are fulfilled using verified Python
 transport, with or without a proxy, instead of native Chromium connections.
-Native HTTP redirects are blocked: Playwright routes only the first request
-of a redirect chain. Redirect-aware browser transport is still required;
-raw HTTP redirects remain supported and are validated per hop.
+Chromium uses CDP Fetch to pause every native redirect hop before verified
+transport, preserving real responses, final origin and browser semantics.
+Unintercepted native connections are denied by a non-forwarding socket barrier.
+Other browser engines retain the strict route fallback, which blocks redirects.
+Some worker loaders are unavailable to Fetch; unsupported loads fail closed.
 
 Codex Cloud's private proxy socket is trusted only through immutable platform
 metadata and static host mappings. This does not trust private audit targets.
@@ -1511,6 +1513,8 @@ def safe_requests_session(url: str) -> Iterator[requests.Session]:
 
 def make_safe_playwright_route_handler(
     blocked_resource_types: Optional[set] = None,
+    *,
+    max_redirects: int = 20,
 ):
     """
     Build a Playwright ``page.route()`` callback that aborts subresource
@@ -1533,12 +1537,27 @@ def make_safe_playwright_route_handler(
         Callable ``(route, request) -> None`` suitable for
         ``page.route("**/*", handler)``.
     """
+    if type(max_redirects) is not int or not 0 <= max_redirects <= 20:
+        raise ValueError('max_redirects must be an integer between 0 and 20')
     blocked = set(blocked_resource_types or ())
     failures: list[str] = []
 
     def handler(route, request):  # type: ignore[no-untyped-def]
         try:
+            if not getattr(route, 'supports_redirects', False):
+                # Legacy page.route registrations may coexist with the CDP
+                # context guard. That independent guard owns the actual HTTP
+                # request; do not fetch it twice or override its response.
+                try:
+                    guarded = getattr(request.frame.page.context, '_claude_seo_cdp_transport', None)
+                except Exception:
+                    guarded = None
+                if guarded:
+                    route.continue_()
+                    return
             if blocked and request.resource_type in blocked:
+                if getattr(route, 'supports_redirects', False):
+                    route.intentional_skip = True
                 route.abort()
                 return
 
@@ -1598,11 +1617,13 @@ def make_safe_playwright_route_handler(
                 pass
 
     handler.failures = failures
+    handler.max_redirects = max_redirects
+    handler.supports_cdp_transport = True
     return handler
 
 
 class _UnsafeBrowserRedirect(URLSafetyError):
-    """Never emit a redirect Chromium can follow outside our route guard."""
+    """Return actual responses; only the per-hop CDP guard may emit redirects."""
 
 
 def _fulfill_verified_route(route, request):
@@ -1613,7 +1634,9 @@ def _fulfill_verified_route(route, request):
         data=request.post_data_buffer, timeout=30, stream=True, allow_redirects=False,
     )
     try:
-        if response.status_code in (301, 302, 303, 307, 308) and response.headers.get('Location'):
+        if (response.status_code in (301, 302, 303, 307, 308)
+                and response.headers.get('Location')
+                and not getattr(route, 'supports_redirects', False)):
             # Playwright only routes the FIRST request of an HTTP redirect
             # chain. Forwarding a 3xx lets Chromium connect to later targets
             # without this guard. Do not replace it with a 200/body rewrite:
@@ -1647,8 +1670,10 @@ def new_guarded_context(browser, route_handler, **context_kwargs):  # type: igno
 
     * blocks service worker registration (``service_workers="block"``),
       so every request stays visible to the route handler;
-    * routes every request of every page, popups included, through
-      ``route_handler`` (a page-level route still takes precedence);
+    * pauses Chromium targets before startup and validates each CDP Fetch
+      request/redirect through ``route_handler``; a deny-only native proxy
+      barrier blocks loads missed by interception (it never forwards traffic);
+    * uses strict context routing for other engines, blocking HTTP redirects;
     * routes every WebSocket to a handler that never calls
       ``connect_to_server()``, so Playwright mocks the socket and no
       connection ever reaches a server (Playwright 1.48+). The handler
@@ -1667,9 +1692,47 @@ def new_guarded_context(browser, route_handler, **context_kwargs):  # type: igno
     """
     if context_kwargs.get('ignore_https_errors'):
         raise URLSafetyError('TLS verification is required for guarded browser contexts')
-    context = browser.new_context(service_workers="block", **context_kwargs)
-    context.route("**/*", route_handler)
+    chromium_transport = (
+        getattr(getattr(browser, 'browser_type', None), 'name', None) == 'chromium'
+        and getattr(route_handler, 'supports_cdp_transport', False)
+    )
+    native_barrier = None
+    if chromium_transport:
+        if 'proxy' in context_kwargs:
+            raise URLSafetyError('Configure egress through the verified environment transport')
+        # Reserve, but never listen on, a local port. Native Chromium requests
+        # which escape/precede interception can only fail against this socket;
+        # they cannot reach any origin, LAN endpoint or WebSocket server.
+        # This is DENY-ONLY, not a forwarding proxy. Actual HTTP requests still
+        # use the inherited egress/CA settings through _managed_request.
+        native_barrier = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        native_barrier.bind(('127.0.0.1', 0))
+        context_kwargs['proxy'] = {
+            'server': f'http://127.0.0.1:{native_barrier.getsockname()[1]}',
+            'bypass': '<-loopback>',  # Remove Chromium's implicit localhost bypass.
+        }
+    try:
+        context = browser.new_context(service_workers="block", **context_kwargs)
+    except Exception:
+        if native_barrier:
+            native_barrier.close()
+        raise
+    if native_barrier:
+        context._claude_seo_native_barrier = native_barrier
+        context.on('close', lambda *_: native_barrier.close())
     context.route_web_socket("**/*", _never_connect_web_socket)
+    if chromium_transport:
+        from browser_transport import install
+
+        try:
+            install(browser, context, route_handler)
+        except Exception as exc:
+            context.close()
+            raise URLSafetyError('Chromium verified transport setup failed') from exc
+    else:
+        # Unsupported engines/test doubles retain the fail-closed route path;
+        # never silently enable native redirect following without CDP.
+        context.route("**/*", route_handler)
     return context
 
 

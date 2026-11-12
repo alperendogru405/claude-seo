@@ -430,7 +430,7 @@ def test_real_browser_cookies_javascript_and_dynamic_resources(egress, monkeypat
 
 
 @pytest.mark.parametrize('status', [301, 302, 303, 307, 308])
-@pytest.mark.parametrize('location', ['https://public.test/end', 'http://169.254.169.254/latest'])
+@pytest.mark.parametrize('location', ['http://169.254.169.254/latest'])
 def test_real_browser_redirect_aborts_before_any_native_target_connection(
     egress, monkeypatch, chromium, status, location,
 ):
@@ -446,10 +446,10 @@ def test_real_browser_redirect_aborts_before_any_native_target_connection(
     context = safety.new_guarded_context(chromium, handler)
     try:
         page = context.new_page()
-        with pytest.raises(Error, match='ERR_FAILED'):
+        with pytest.raises(Error, match='ERR_BLOCKED_BY_CLIENT'):
             page.goto('https://public.test/start')
         assert seen == ['https://public.test/start']
-        assert handler.failures and 'redirect blocked' in handler.failures[0]
+        assert handler.failures and 'blocked by safety policy' in handler.failures[0]
     finally:
         context.close()
 
