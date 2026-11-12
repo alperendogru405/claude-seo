@@ -793,13 +793,22 @@ def render_page(
                     user_agent=user_agent or USER_AGENT,
                 )
                 page = context.new_page()
+                navigation_responses = []
 
                 def _on_console(msg):  # type: ignore[no-untyped-def]
                     if msg.type == "error":
                         result["console_errors"].append(msg.text)
 
                 page.on("console", _on_console)
-                page.route("**/*", route_handler)
+
+                def _on_response(response):
+                    request = response.request
+                    if request.is_navigation_request() and request.frame == page.main_frame:
+                        navigation_responses.append(response)
+
+                page.on("response", _on_response)
+                if not getattr(context, '_claude_seo_cdp_transport', None):
+                    page.route("**/*", route_handler)
 
                 try:
                     response = page.goto(
@@ -817,6 +826,8 @@ def render_page(
                         "captured the available DOM"
                     )
 
+                if navigation_responses:
+                    response = navigation_responses[-1]
                 result["url"] = page.url
                 result["content"] = page.content()
                 result["status_code"] = response.status if response else raw_status
@@ -824,6 +835,18 @@ def render_page(
                     dict(response.all_headers()) if response else raw_headers
                 )
                 result["render_engine"] = "playwright-chromium"
+                native_request = getattr(response, "request", None)
+                if isinstance(getattr(native_request, "url", None), str):
+                    redirects = []
+                    previous = native_request.redirected_from
+                    while previous is not None:
+                        previous_response = previous.response()
+                        redirects.append({
+                            "url": previous.url,
+                            "status_code": previous_response.status if previous_response else None,
+                        })
+                        previous = previous.redirected_from
+                    result["redirect_chain"] = list(reversed(redirects))
 
                 if extract_accessibility:
                     try:
@@ -856,6 +879,7 @@ def render_page(
             _keep_raw_on_render_failure()
             return result
         finally:
+            result["render_diagnostics"].extend(getattr(route_handler, "failures", []))
             result["render_ms"] = (time.monotonic() - start) * 1000.0
 
         # Both versions exist: measure what only JavaScript provides.

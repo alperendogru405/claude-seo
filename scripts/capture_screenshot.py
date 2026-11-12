@@ -476,7 +476,8 @@ def capture_screenshot(
 
             # Defence in depth: abort any subresource that lands on a
             # private IP even after Chromium re-resolves DNS.
-            page.route("**/*", route_handler)
+            if not getattr(context, '_claude_seo_cdp_transport', None):
+                page.route("**/*", route_handler)
 
             # Navigate and wait for network idle
             page.goto(url, wait_until="networkidle", timeout=timeout)
